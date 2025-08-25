@@ -1,13 +1,19 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{ SampleFormat, StreamConfig};
+use cpal::{SampleFormat, Stream, StreamConfig};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use vosk::{ DecodingState, Model, Recognizer};
+use vosk::{DecodingState, Model, Recognizer};
 
 const DEFAULT_WAKE: &[&str] = &["hey iris"];
+
+#[derive(Clone)]
+enum ListeningState {
+    Idle,
+    WakeDetected { time: Instant },
+}
 
 fn looks_like_vosk_model_dir(dir: &Path) -> bool {
     if !dir.is_dir() {
@@ -41,12 +47,10 @@ fn looks_like_vosk_model_dir(dir: &Path) -> bool {
             }
         }
     }
-    // Many Vosk models have am+graph+conf; some have conf and other assets. Be permissive but not too loose.
     (has_am && has_graph) || (has_conf && (has_am || has_graph))
 }
 
 fn resolve_model_dir() -> Result<PathBuf, String> {
-    // Priority: VOSK_MODEL env -> first CLI arg -> ./src/model -> ./model
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(p) = env::var("VOSK_MODEL") {
         candidates.push(PathBuf::from(p));
@@ -60,12 +64,9 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
     candidates.push(manifest_dir.join("src").join("model"));
     candidates.push(manifest_dir.join("model"));
 
-    // Expand candidates: if a candidate is a directory that contains exactly one subdirectory and
-    // itself doesn't look like a model, try that subdirectory.
     let mut expanded: Vec<PathBuf> = Vec::new();
     for cand in candidates {
         if cand.is_file() {
-            // Probably a tar.gz or wrong path; skip but note later
             expanded.push(cand);
             continue;
         }
@@ -82,13 +83,11 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
                     }
                 }
             }
-            // Prefer a subdir that looks like a model
             for sd in &subdirs {
                 if looks_like_vosk_model_dir(sd) {
                     return Ok(sd.clone());
                 }
             }
-            // If only one subdir, try it anyway
             if subdirs.len() == 1 {
                 let sd = &subdirs[0];
                 if looks_like_vosk_model_dir(sd) {
@@ -101,7 +100,6 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
         }
     }
 
-    // Build an informative error message
     let mut msg = String::from("Failed to locate a valid Vosk acoustic model directory.\n");
     msg.push_str(
         "Tried the following locations (env VOSK_MODEL, CLI arg, ./src/model, ./model):\n",
@@ -109,7 +107,6 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
     for p in expanded {
         msg.push_str(&format!(" - {}\n", p.display()));
         if p.is_dir() {
-            // Check if it looks like a lib folder (contains libvosk or vosk_api.h)
             if let Ok(rd) = fs::read_dir(&p) {
                 let mut has_lib = false;
                 let mut has_header = false;
@@ -143,7 +140,6 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
 }
 
 fn main() {
-    // Allow overriding native lib path so user can point to their libvosk.so location
     if let Ok(lib_dir) = env::var("VOSK_LIB_DIR") {
         let paths = env::var_os("LD_LIBRARY_PATH")
             .map(PathBuf::from)
@@ -151,8 +147,7 @@ fn main() {
         let new = if paths.as_os_str().is_empty() {
             PathBuf::from(lib_dir)
         } else {
-            let mut p = PathBuf::from(env::var("LD_LIBRARY_PATH").unwrap_or_default());
-            // crude append with ':' for unix
+            let p = PathBuf::from(env::var("LD_LIBRARY_PATH").unwrap_or_default());
             let combined = format!("{}:{}", lib_dir, p.display());
             PathBuf::from(combined)
         };
@@ -161,7 +156,6 @@ fn main() {
         }
     }
 
-    // Resolve model directory robustly
     let model_dir = match resolve_model_dir() {
         Ok(p) => p,
         Err(msg) => {
@@ -170,15 +164,6 @@ fn main() {
         }
     };
 
-    // Wake words: comma-separated in VOSK_WAKE or second arg
-    let wake_words: Vec<String> = DEFAULT_WAKE.iter().map(|s| s.to_string()).collect();
-
-    if wake_words.is_empty() {
-        eprintln!("No wake words provided. Set VOSK_WAKE env var or pass as second CLI arg.");
-        std::process::exit(1);
-    }
-
-    // Load Vosk model
     let model_path_str: String = model_dir.to_string_lossy().into_owned();
     let model = match Model::new(&model_path_str) {
         Some(m) => m,
@@ -191,7 +176,6 @@ fn main() {
         }
     };
 
-    // Initialize audio input via cpal
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -207,109 +191,148 @@ fn main() {
 
     let mut config: StreamConfig = supported_config.clone().into();
 
-    // We prefer mono; if device supports more channels, we will downmix by averaging
     if config.channels == 0 {
         config.channels = 1;
     }
 
     let sample_rate_hz = config.sample_rate.0 as f32;
 
-    // Build grammar JSON from wake words to constrain decoder to those phrases
-    // Example: ["hey iris","ok iris","computer"]
-    let mut grammar = String::from("[");
-    for (i, w) in wake_words.iter().enumerate() {
-        if i > 0 {
-            grammar.push(',');
-        }
-        grammar.push('"');
-        grammar.push_str(&w);
-        grammar.push('"');
+    let mut recognizer1 =
+        Recognizer::new(&model, sample_rate_hz).expect("Failed to create recognizer");
+    let mut recognizer2 =
+        Recognizer::new(&model, sample_rate_hz).expect("Failed to create recognizer");
+
+    for rec in [&mut recognizer1, &mut recognizer2] {
+        let _ = rec.set_max_alternatives(0);
+        let _ = rec.set_words(false);
+        let _ = rec.set_partial_words(false);
+        let _ = rec.set_nlsml(false);
     }
-    grammar.push(']');
 
-    // Recognizer: try with grammar; if not supported, fall back to normal recognizer
-    let grammar_vec: Vec<&str> = wake_words.iter().map(|s| s.as_str()).collect();
-    let mut recognizer = Recognizer::new_with_grammar(&model, sample_rate_hz, &grammar_vec)
-        .or_else(|| Recognizer::new(&model, sample_rate_hz))
-        .expect("Failed to create recognizer");
+    let active_recognizer = Arc::new(Mutex::new(0u8)); // 0 or 1
+    let recognizers = Arc::new(Mutex::new([recognizer1, recognizer2]));
 
-    // Smaller max alternatives improves speed; set to 0 for best; and disable words to reduce latency
-    let _ = recognizer.set_max_alternatives(0);
-    let _ = recognizer.set_words(false);
+    let recognizers_clone = recognizers.clone();
+    let active_clone = active_recognizer.clone();
+    // Replace the swap thread with this version:
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(600)); // 10 seconds for testing
+
+            let active = *active_clone.lock().unwrap();
+            let inactive = 1 - active;
+
+            // Recreate inactive recognizer using existing model
+            {
+                let mut recs = recognizers_clone.lock().unwrap();
+                // Drop old recognizer explicitly
+                drop(std::mem::replace(&mut recs[inactive as usize],
+                                       Recognizer::new(&model, sample_rate_hz).unwrap()));
+
+                let _ = recs[inactive as usize].set_max_alternatives(0);
+                let _ = recs[inactive as usize].set_words(false);
+                let _ = recs[inactive as usize].set_partial_words(false);
+                let _ = recs[inactive as usize].set_nlsml(false);
+            } // Release lock before swap
+
+            *active_clone.lock().unwrap() = inactive;
+            println!("Swapped to fresh recognizer");
+        }
+    });
 
     println!(
         "Listening for wake words: {} (sample rate: {} Hz, channels: {})",
-        wake_words.join(", "),
+        DEFAULT_WAKE.join(", "),
         sample_rate_hz,
         config.channels
-    );
-    println!(
-        "Tip: export VOSK_MODEL=/path/to/vosk-model and VOSK_LIB_DIR=/path/to containing libvosk.so if needed."
     );
 
     let triggered = Arc::new(Mutex::new(false));
     let triggered_clone = triggered.clone();
-    let wake_words_clone = wake_words.clone();
+    let state = Arc::new(Mutex::new(ListeningState::Idle));
+    let state_clone = state.clone();
 
     let err_flag = Arc::new(Mutex::new(None::<String>));
     let err_flag_clone = err_flag.clone();
 
-    let mut stream = match supported_config.sample_format() {
-        SampleFormat::I16 => (
-            build_input_stream_i16(
-                &device,
-                &config,
-                recognizer,
-                triggered_clone,
-                wake_words_clone,
-                err_flag_clone,
-            ),
-            "I16",
+    let stream: Stream = match supported_config.sample_format() {
+        SampleFormat::I16 => build_input_stream_i16(
+            &device,
+            &config,
+            recognizers.clone(),
+            active_recognizer.clone(),
+            triggered_clone,
+            DEFAULT_WAKE,
+            state_clone,
+            err_flag_clone,
         ),
-        SampleFormat::U16 => (
-            build_input_stream_u16(
-                &device,
-                &config,
-                recognizer,
-                triggered_clone,
-                wake_words_clone,
-                err_flag_clone,
-            ),
-            "U16",
+        SampleFormat::U16 => build_input_stream_u16(
+            &device,
+            &config,
+            recognizers.clone(),
+            active_recognizer.clone(),
+            triggered_clone,
+            DEFAULT_WAKE,
+            state_clone,
+            err_flag_clone,
         ),
-        SampleFormat::F32 => (
-            build_input_stream_f32(
-                &device,
-                &config,
-                recognizer,
-                triggered_clone,
-                wake_words_clone,
-                err_flag_clone,
-            ),
-            "I16",
+        SampleFormat::F32 => build_input_stream_f32(
+            &device,
+            &config,
+            recognizers.clone(),
+            active_recognizer.clone(),
+            triggered_clone,
+            DEFAULT_WAKE,
+            state_clone,
+            err_flag_clone,
         ),
         _ => panic!("Unsupported sample format"),
     };
 
-    println!("Using {} input stream", stream.1);
+    stream.play().expect("Failed to start input stream");
 
-    stream.0.play().expect("Failed to start input stream");
-
-    // Wait until triggered or error
     let start = Instant::now();
+    let mut listening_printed = false;
     loop {
         if let Some(err) = err_flag.lock().unwrap().take() {
             eprintln!("Stream error: {}", err);
             break;
         }
         if *triggered.lock().unwrap() {
-            println!("Wake word detected.\n");
+            println!("Command processed.\n");
             break;
         }
+
+        if let Ok(current_state) = state.lock() {
+            if let ListeningState::WakeDetected { time } = &*current_state {
+                let elapsed = time.elapsed();
+                println!(
+                    "When listening started:{:?},\nRight now: {:?},\nWhen wake was detected: {:?}",
+                    start,
+                    Instant::now(),
+                    time
+                );
+
+                if elapsed > Duration::from_millis(350) {
+                    if !listening_printed {
+                        println!("Listening for command...");
+                        listening_printed = true;
+                    }
+                    if elapsed > Duration::from_secs(3)
+                    /*
+                    How long before we decide they took too long
+                    */
+                    {
+                        println!("No command detected. Resetting.");
+                        break;
+                    }
+                    // Don't reset to Idle - keep waiting for command
+                }
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(50));
-        // Safety timeout optional
         if start.elapsed() > Duration::from_secs(24 * 60 * 60) {
-            // 24h
             break;
         }
     }
@@ -318,12 +341,15 @@ fn main() {
 fn build_input_stream_i16(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut recognizer: Recognizer,
+    recognizers: Arc<Mutex<[Recognizer; 2]>>,
+    active_recognizer: Arc<Mutex<u8>>,
     triggered: Arc<Mutex<bool>>,
-    wake_words: Vec<String>,
+    wake_words: &'static [&'static str],
+    state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
 ) -> cpal::Stream {
     let channels = config.channels as usize;
+
     let data_fn = move |data: &[i16], _: &cpal::InputCallbackInfo| {
         let mut pcm_mono: Vec<i16> = Vec::with_capacity(data.len() / channels + 1);
         if channels <= 1 {
@@ -338,13 +364,24 @@ fn build_input_stream_i16(
                 pcm_mono.push(avg);
             }
         }
-        create_waveform_match(&mut recognizer, &pcm_mono, &wake_words, &triggered);
+
+        let active_idx = *active_recognizer.lock().unwrap() as usize;
+        let mut recs = recognizers.lock().unwrap();
+        create_waveform_match(
+            &mut recs[active_idx],
+            &pcm_mono,
+            &wake_words,
+            &triggered,
+            &state,
+        );
     };
+
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
             *e = Some(format!("CPAL stream error: {}", err));
         }
     };
+
     device
         .build_input_stream(config, data_fn, err_fn, None)
         .expect("Failed to build input stream")
@@ -353,12 +390,15 @@ fn build_input_stream_i16(
 fn build_input_stream_u16(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut recognizer: Recognizer,
+    recognizers: Arc<Mutex<[Recognizer; 2]>>,
+    active_recognizer: Arc<Mutex<u8>>,
     triggered: Arc<Mutex<bool>>,
-    wake_words: Vec<String>,
+    wake_words: &'static [&'static str],
+    state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
 ) -> cpal::Stream {
     let channels = config.channels as usize;
+
     let data_fn = move |data: &[u16], _: &cpal::InputCallbackInfo| {
         let mut pcm_mono: Vec<i16> = Vec::with_capacity(data.len() / channels + 1);
         if channels <= 1 {
@@ -370,19 +410,30 @@ fn build_input_stream_u16(
             for frame in data.chunks_exact(channels) {
                 let mut acc: i32 = 0;
                 for &s in frame.iter() {
-                    acc += (s as i32 - 32768);
+                    acc += s as i32 - 32768;
                 }
                 let avg = (acc / channels as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                 pcm_mono.push(avg);
             }
         }
-        create_waveform_match(&mut recognizer, &pcm_mono, &wake_words, &triggered);
+
+        let active_idx = *active_recognizer.lock().unwrap() as usize;
+        let mut recs = recognizers.lock().unwrap();
+        create_waveform_match(
+            &mut recs[active_idx],
+            &pcm_mono,
+            &wake_words,
+            &triggered,
+            &state,
+        );
     };
+
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
             *e = Some(format!("CPAL stream error: {}", err));
         }
     };
+
     device
         .build_input_stream(config, data_fn, err_fn, None)
         .expect("Failed to build input stream")
@@ -391,14 +442,17 @@ fn build_input_stream_u16(
 fn build_input_stream_f32(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut recognizer: Recognizer,
+    recognizers: Arc<Mutex<[Recognizer; 2]>>,
+    active_recognizer: Arc<Mutex<u8>>,
     triggered: Arc<Mutex<bool>>,
-    wake_words: Vec<String>,
+    wake_words: &'static [&'static str],
+    state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
 ) -> cpal::Stream {
     let channels = config.channels as usize;
+
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        let mut pcm_mono: Vec<i16> = Vec::with_capacity(data.len() / channels + 1);
+        let mut pcm_mono: Vec<i16> = Vec::with_capacity(4096usize);
         if channels <= 1 {
             for &s in data.iter() {
                 let v = (s * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
@@ -415,55 +469,115 @@ fn build_input_stream_f32(
                 pcm_mono.push(v);
             }
         }
-        create_waveform_match(&mut recognizer, &pcm_mono, &wake_words, &triggered);
+
+        let active_idx = *active_recognizer.lock().unwrap() as usize;
+        let mut recs = recognizers.lock().unwrap();
+        create_waveform_match(
+            &mut recs[active_idx],
+            &pcm_mono,
+            &wake_words,
+            &triggered,
+            &state,
+        );
     };
+
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
             *e = Some(format!("CPAL stream error: {}", err));
         }
     };
+
     device
         .build_input_stream(config, data_fn, err_fn, None)
         .expect("Failed to build input stream")
 }
 
 fn extract_text_from_complete_json(result_json: &str) -> Option<String> {
-    // complete JSON looks like: {"text": "hey iris"} or {"text":""}
     let v: serde_json::Value = serde_json::from_str(result_json).ok()?;
     v.get("text")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
 }
 
-fn is_wake_word(text: &str, wake_words: &[String]) -> bool {
+fn contains_wake_word(text: &str, wake_words: &[&str]) -> Option<String> {
     let t = text.trim().to_lowercase();
     if t.is_empty() {
-        return false;
+        return None;
     }
+
+    for wake_word in wake_words {
+        if let Some(pos) = t.find(wake_word) {
+            let after_wake = &t[pos + wake_word.len()..].trim();
+            return if !after_wake.is_empty() {
+                Some(format!("{} {}", wake_word, after_wake))
+            } else {
+                Some(wake_word.to_string())
+            };
+        }
+    }
+    None
+}
+
+fn is_just_wake_word(text: &str, wake_words: &[&str]) -> bool {
+    let t = text.trim().to_lowercase();
     wake_words.iter().any(|w| t == *w)
 }
 
 fn create_waveform_match(
     recognizer: &mut Recognizer,
     pcm_mono: &[i16],
-    wake_words: &[String],
+    wake_words: &[&str],
     triggered: &Arc<Mutex<bool>>,
+    state: &Arc<Mutex<ListeningState>>,
 ) {
     match recognizer.accept_waveform(&pcm_mono) {
         Ok(DecodingState::Running) => {
-            // Ignore partial results to avoid premature triggering on single words.
+            // Force periodic cleanup every ~1000 calls
+            static mut CALL_COUNT: u32 = 0;
+            unsafe {
+                CALL_COUNT += 1;
+                if CALL_COUNT % 1000 == 0 {
+                    let _ = recognizer.reset();
+                }
+            }
         }
         Ok(_) => {
             let complete = recognizer.result();
             if let Ok(json) = serde_json::to_string(&complete) {
                 if let Some(text) = extract_text_from_complete_json(&json) {
-                    if is_wake_word(&text, &wake_words) {
-                        if let Ok(mut t) = triggered.lock() {
-                            *t = true;
+                    let current_state = state.lock().unwrap().clone();
+
+                    match current_state {
+                        ListeningState::Idle => {
+                            if let Some(full_command) = contains_wake_word(&text, &wake_words) {
+                                if is_just_wake_word(&text, &wake_words) {
+                                    // Just wake word detected, start pause timer
+                                    *state.lock().unwrap() = ListeningState::WakeDetected {
+                                        time: Instant::now(),
+                                    };
+                                } else {
+                                    // Full command in one go
+                                    println!("Full command: {}", full_command);
+                                    if let Ok(mut t) = triggered.lock() {
+                                        *t = true;
+                                    }
+                                }
+                            }
+                        }
+                        ListeningState::WakeDetected { .. } => {
+                            // Any speech after wake word is treated as command
+                            if !text.trim().is_empty() {
+                                println!("Full command: hey iris {}", text.trim());
+                                if let Ok(mut t) = triggered.lock() {
+                                    *t = true;
+                                }
+                                *state.lock().unwrap() = ListeningState::Idle;
+                            }
                         }
                     }
                 }
             }
+            println!("resetting");
             let _ = recognizer.reset();
         }
         Err(_) => {}
