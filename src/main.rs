@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
+use cpal::{Device, Host, SampleFormat, Stream, StreamConfig};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -139,6 +139,37 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
     Err(msg)
 }
 
+fn match_input_device(host: &Host, device_name: &str) -> Option<Device> {
+    for device in host.input_devices().unwrap() {
+        if device.name().unwrap() == device_name {
+            return Some(device);
+        }
+    }
+    None
+}
+
+fn collect_launch_args() -> Option<Vec<(String, String)>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i].starts_with("--") && i + 1 < args.len() {
+            let key = args[i].clone();
+            let mut value = args[i + 1].clone();
+            i += 2;
+            // Collect remaining non-flag args as part of this value
+            while i < args.len() && !args[i].starts_with("--") {
+                value.push(' ');
+                value.push_str(&args[i]);
+                i += 1;
+            }
+            pairs.push((key, value));
+        } else {
+            i += 1;
+        }
+    }
+    Some(pairs)
+}
 fn main() {
     if let Ok(lib_dir) = env::var("VOSK_LIB_DIR") {
         let paths = env::var_os("LD_LIBRARY_PATH")
@@ -156,6 +187,7 @@ fn main() {
         }
     }
 
+    let args = collect_launch_args().unwrap_or_default();
     let model_dir = match resolve_model_dir() {
         Ok(p) => p,
         Err(msg) => {
@@ -176,10 +208,21 @@ fn main() {
         }
     };
 
+
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .expect("No default input device available");
+    // for device in host.input_devices().unwrap() {
+    //     println!("Input device: {:?}", device.name());
+    // }
+    // println!("{:?}", args);
+    let selected_device = args.iter().find(|(key, _)| key == "--device");
+
+    let device = if let Some((_, value)) = selected_device {
+        match_input_device(&host, value).unwrap_or_else(|| host.default_input_device().expect("No default input device available"))
+    } else {
+        host.default_input_device().expect("No default input device available")
+    };
+
+    println!("Using input device: {device:?}\n[DEVICE]({device:?})", device=device.name());
 
     let supported_config = match device.default_input_config() {
         Ok(cfg) => cfg,
@@ -217,7 +260,7 @@ fn main() {
     // Replace the swap thread with this version:
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(Duration::from_secs(600)); // 10 seconds for testing
+            std::thread::sleep(Duration::from_secs(600)); // 10 seconds for testing, 600 seconds in prod
 
             let active = *active_clone.lock().unwrap();
             let inactive = 1 - active;
@@ -226,8 +269,10 @@ fn main() {
             {
                 let mut recs = recognizers_clone.lock().unwrap();
                 // Drop old recognizer explicitly
-                drop(std::mem::replace(&mut recs[inactive as usize],
-                                       Recognizer::new(&model, sample_rate_hz).unwrap()));
+                drop(std::mem::replace(
+                    &mut recs[inactive as usize],
+                    Recognizer::new(&model, sample_rate_hz).unwrap(),
+                ));
 
                 let _ = recs[inactive as usize].set_max_alternatives(0);
                 let _ = recs[inactive as usize].set_words(false);
@@ -236,12 +281,12 @@ fn main() {
             } // Release lock before swap
 
             *active_clone.lock().unwrap() = inactive;
-            println!("Swapped to fresh recognizer");
+            println!("Swapped to fresh recognizer\n[SWAP]");
         }
     });
 
     println!(
-        "Listening for wake words: {} (sample rate: {} Hz, channels: {})",
+        "Listening for wake words: {} (sample rate: {} Hz, channels: {}) [LISTENING]",
         DEFAULT_WAKE.join(", "),
         sample_rate_hz,
         config.channels
@@ -299,7 +344,7 @@ fn main() {
             break;
         }
         if *triggered.lock().unwrap() {
-            println!("Command processed.\n");
+            println!("Command processed.\n[PROCESSED]");
             break;
         }
 
@@ -315,7 +360,7 @@ fn main() {
 
                 if elapsed > Duration::from_millis(350) {
                     if !listening_printed {
-                        println!("Listening for command...");
+                        println!("Listening for command...\n[WAITING]");
                         listening_printed = true;
                     }
                     if elapsed > Duration::from_secs(3)
@@ -323,7 +368,7 @@ fn main() {
                     How long before we decide they took too long
                     */
                     {
-                        println!("No command detected. Resetting.");
+                        println!("No command detected. Resetting.[RESETTING]");
                         break;
                     }
                     // Don't reset to Idle - keep waiting for command
@@ -339,7 +384,7 @@ fn main() {
 }
 
 fn build_input_stream_i16(
-    device: &cpal::Device,
+    device: &Device,
     config: &StreamConfig,
     recognizers: Arc<Mutex<[Recognizer; 2]>>,
     active_recognizer: Arc<Mutex<u8>>,
@@ -347,7 +392,7 @@ fn build_input_stream_i16(
     wake_words: &'static [&'static str],
     state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
-) -> cpal::Stream {
+) -> Stream {
     let channels = config.channels as usize;
 
     let data_fn = move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -388,7 +433,7 @@ fn build_input_stream_i16(
 }
 
 fn build_input_stream_u16(
-    device: &cpal::Device,
+    device: &Device,
     config: &StreamConfig,
     recognizers: Arc<Mutex<[Recognizer; 2]>>,
     active_recognizer: Arc<Mutex<u8>>,
@@ -396,7 +441,7 @@ fn build_input_stream_u16(
     wake_words: &'static [&'static str],
     state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
-) -> cpal::Stream {
+) -> Stream {
     let channels = config.channels as usize;
 
     let data_fn = move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -440,7 +485,7 @@ fn build_input_stream_u16(
 }
 
 fn build_input_stream_f32(
-    device: &cpal::Device,
+    device: &Device,
     config: &StreamConfig,
     recognizers: Arc<Mutex<[Recognizer; 2]>>,
     active_recognizer: Arc<Mutex<u8>>,
@@ -448,7 +493,7 @@ fn build_input_stream_f32(
     wake_words: &'static [&'static str],
     state: Arc<Mutex<ListeningState>>,
     err_flag: Arc<Mutex<Option<String>>>,
-) -> cpal::Stream {
+) -> Stream {
     let channels = config.channels as usize;
 
     let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -557,7 +602,7 @@ fn create_waveform_match(
                                     };
                                 } else {
                                     // Full command in one go
-                                    println!("Full command: {}", full_command);
+                                    println!("Full command: {command}\n[COMMAND](hey iris {command})", command=full_command);
                                     if let Ok(mut t) = triggered.lock() {
                                         *t = true;
                                     }
@@ -567,7 +612,7 @@ fn create_waveform_match(
                         ListeningState::WakeDetected { .. } => {
                             // Any speech after wake word is treated as command
                             if !text.trim().is_empty() {
-                                println!("Full command: hey iris {}", text.trim());
+                                println!("Full command: hey iris {command}\n[COMMAND](hey iris {command})", command=text.trim());
                                 if let Ok(mut t) = triggered.lock() {
                                     *t = true;
                                 }
@@ -577,7 +622,6 @@ fn create_waveform_match(
                     }
                 }
             }
-            println!("resetting");
             let _ = recognizer.reset();
         }
         Err(_) => {}
