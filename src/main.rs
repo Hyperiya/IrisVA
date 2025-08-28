@@ -191,7 +191,7 @@ fn main() {
     let model_dir = match resolve_model_dir() {
         Ok(p) => p,
         Err(msg) => {
-            eprintln!("{}", msg);
+            eprintln!("{}\n[ERR]", msg);
             std::process::exit(2);
         }
     };
@@ -201,7 +201,7 @@ fn main() {
         Some(m) => m,
         None => {
             eprintln!(
-                "Failed to load Vosk model at '{}'.\n- Ensure you have extracted a Vosk acoustic model directory there (not just libvosk.so).\n- You can set env VOSK_MODEL=/path/to/model or pass it as the first CLI arg.\n- Place libvosk.so somewhere in your loader path or set VOSK_LIB_DIR.",
+                "Failed to load Vosk model at '{}'.\n- Ensure you have extracted a Vosk acoustic model directory there (not just libvosk.so).\n- You can set env VOSK_MODEL=/path/to/model or pass it as the first CLI arg.\n- Place libvosk.so somewhere in your loader path or set VOSK_LIB_DIR. [ERR]",
                 model_path_str
             );
             std::process::exit(2);
@@ -217,7 +217,7 @@ fn main() {
     let selected_device = args.iter().find(|(key, _)| key == "--device");
 
     let device = if let Some((_, value)) = selected_device {
-        match_input_device(&host, value).unwrap_or_else(|| host.default_input_device().expect("No default input device available"))
+        match_input_device(&host, value).unwrap_or_else(|| host.default_input_device().expect("No default input device available[ERR]"))
     } else {
         host.default_input_device().expect("No default input device available")
     };
@@ -227,7 +227,7 @@ fn main() {
     let supported_config = match device.default_input_config() {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Failed to get default input config: {:?}", e);
+            eprintln!("Failed to get default input config: {:?}[ERR]", e);
             std::process::exit(3);
         }
     };
@@ -340,7 +340,7 @@ fn main() {
     let mut listening_printed = false;
     loop {
         if let Some(err) = err_flag.lock().unwrap().take() {
-            eprintln!("Stream error: {}", err);
+            eprintln!("Stream error: {}\n[ERR]", err);
             break;
         }
         if *triggered.lock().unwrap() {
@@ -351,12 +351,12 @@ fn main() {
         if let Ok(current_state) = state.lock() {
             if let ListeningState::WakeDetected { time } = &*current_state {
                 let elapsed = time.elapsed();
-                println!(
-                    "When listening started:{:?},\nRight now: {:?},\nWhen wake was detected: {:?}",
-                    start,
-                    Instant::now(),
-                    time
-                );
+                // println!(
+                //     "When listening started:{:?},\nRight now: {:?},\nWhen wake was detected: {:?}",
+                //     start,
+                //     Instant::now(),
+                //     time
+                // );
 
                 if elapsed > Duration::from_millis(350) {
                     if !listening_printed {
@@ -423,13 +423,13 @@ fn build_input_stream_i16(
 
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
-            *e = Some(format!("CPAL stream error: {}", err));
+            *e = Some(format!("CPAL stream error: {}[ERR]", err));
         }
     };
 
     device
         .build_input_stream(config, data_fn, err_fn, None)
-        .expect("Failed to build input stream")
+        .expect("Failed to build input stream[ERR]")
 }
 
 fn build_input_stream_u16(
@@ -475,13 +475,13 @@ fn build_input_stream_u16(
 
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
-            *e = Some(format!("CPAL stream error: {}", err));
+            *e = Some(format!("CPAL stream error: {}[ERR]", err));
         }
     };
 
     device
         .build_input_stream(config, data_fn, err_fn, None)
-        .expect("Failed to build input stream")
+        .expect("Failed to build input stream[ERR]")
 }
 
 fn build_input_stream_f32(
@@ -528,13 +528,13 @@ fn build_input_stream_f32(
 
     let err_fn = move |err: cpal::StreamError| {
         if let Ok(mut e) = err_flag.lock() {
-            *e = Some(format!("CPAL stream error: {}", err));
+            *e = Some(format!("CPAL stream error: {}[ERR]", err));
         }
     };
 
     device
         .build_input_stream(config, data_fn, err_fn, None)
-        .expect("Failed to build input stream")
+        .expect("Failed to build input stream[ERR]")
 }
 
 fn extract_text_from_complete_json(result_json: &str) -> Option<String> {
