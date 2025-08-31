@@ -50,7 +50,7 @@ fn looks_like_vosk_model_dir(dir: &Path) -> bool {
     (has_am && has_graph) || (has_conf && (has_am || has_graph))
 }
 
-fn resolve_model_dir() -> Result<PathBuf, String> {
+fn resolve_model_dir(args: &[(String, String)]) -> Result<PathBuf, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(p) = env::var("VOSK_MODEL") {
         candidates.push(PathBuf::from(p));
@@ -58,11 +58,16 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
     if let Some(arg1) = env::args().skip(1).next() {
         candidates.push(PathBuf::from(arg1));
     }
+    if let Some((_, model_path)) = args.iter().find(|(key, _)| key == "--model") {
+        candidates.push(PathBuf::from(model_path));
+    }
+
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
     candidates.push(manifest_dir.join("src").join("model"));
     candidates.push(manifest_dir.join("model"));
+
 
     let mut expanded: Vec<PathBuf> = Vec::new();
     for cand in candidates {
@@ -102,7 +107,7 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
 
     let mut msg = String::from("Failed to locate a valid Vosk acoustic model directory.\n");
     msg.push_str(
-        "Tried the following locations (env VOSK_MODEL, CLI arg, ./src/model, ./model):\n",
+        "Tried the following locations (env VOSK_MODEL, CLI arg, ./src/model, ./model, supplied path):\n",
     );
     for p in expanded {
         msg.push_str(&format!(" - {}\n", p.display()));
@@ -114,8 +119,7 @@ fn resolve_model_dir() -> Result<PathBuf, String> {
                     let name = e.file_name();
                     let name = name.to_string_lossy().to_string();
                     if name.contains("libvosk")
-                        || name.ends_with("vosk.dll")
-                        || name.ends_with("libvosk.dylib")
+                        || name.ends_with("libvosk.dll")
                         || name.ends_with("libvosk.so")
                     {
                         has_lib = true;
@@ -188,7 +192,7 @@ fn main() {
     }
 
     let args = collect_launch_args().unwrap_or_default();
-    let model_dir = match resolve_model_dir() {
+    let model_dir = match resolve_model_dir(&args) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("{}\n[ERR]", msg);
@@ -210,9 +214,10 @@ fn main() {
 
 
     let host = cpal::default_host();
-    // for device in host.input_devices().unwrap() {
-    //     println!("Input device: {:?}", device.name());
-    // }
+    println!("Available input devices:");
+    for device in host.input_devices().unwrap() {
+        println!("Input device: {:?}", device.name());
+    }
     // println!("{:?}", args);
     let selected_device = args.iter().find(|(key, _)| key == "--device");
 
@@ -340,41 +345,48 @@ fn main() {
     let mut listening_printed = false;
     loop {
         if let Some(err) = err_flag.lock().unwrap().take() {
-            eprintln!("Stream error: {}\n[ERR]", err);
-            break;
+            eprintln!("Stream error: {}\\n[ERR]", err);
+            *triggered.lock().unwrap() = false;
+            *state.lock().unwrap() = ListeningState::Idle;
+            listening_printed = false;
+            continue;
         }
+
         if *triggered.lock().unwrap() {
-            println!("Command processed.\n[PROCESSED]");
-            break;
+            println!("Command processed.\\n[PROCESSED]");
+            *triggered.lock().unwrap() = false;
+            *state.lock().unwrap() = ListeningState::Idle;
+            listening_printed = false;
+            std::thread::sleep(Duration::from_millis(500)); // Prevent immediate retrigger
+            continue;
         }
 
-        if let Ok(current_state) = state.lock() {
-            if let ListeningState::WakeDetected { time } = &*current_state {
+        if let Ok(mut current_state_guard) = state.lock() {
+            if let ListeningState::WakeDetected { time } = &*current_state_guard {
                 let elapsed = time.elapsed();
-                // println!(
-                //     "When listening started:{:?},\nRight now: {:?},\nWhen wake was detected: {:?}",
-                //     start,
-                //     Instant::now(),
-                //     time
-                // );
-
                 if elapsed > Duration::from_millis(350) {
                     if !listening_printed {
-                        println!("Listening for command...\n[WAITING]");
+                        println!("Listening for command...\\n[WAITING]");
                         listening_printed = true;
                     }
-                    if elapsed > Duration::from_secs(3)
-                    /*
-                    How long before we decide they took too long
-                    */
-                    {
+                    if elapsed > Duration::from_secs(3) {
                         println!("No command detected. Resetting.[RESETTING]");
-                        break;
+                        *current_state_guard = ListeningState::Idle; // Modify directly
+                        listening_printed = false;
+
+                        // Reset recognizer
+                        let active_idx = *active_recognizer.lock().unwrap() as usize;
+                        let mut recs = recognizers.lock().unwrap();
+                        let _ = recs[active_idx].reset();
+
+                        continue;
                     }
-                    // Don't reset to Idle - keep waiting for command
                 }
+            } else {
+                listening_printed = false;
             }
         }
+
 
         std::thread::sleep(Duration::from_millis(50));
         if start.elapsed() > Duration::from_secs(24 * 60 * 60) {
@@ -612,13 +624,23 @@ fn create_waveform_match(
                         ListeningState::WakeDetected { .. } => {
                             // Any speech after wake word is treated as command
                             if !text.trim().is_empty() {
-                                println!("Full command: hey iris {command}\n[COMMAND](hey iris {command})", command=text.trim());
+                                println!("Full command: hey iris {command}\\n[COMMAND]({command})", command=text.trim());
                                 if let Ok(mut t) = triggered.lock() {
                                     *t = true;
                                 }
                                 *state.lock().unwrap() = ListeningState::Idle;
+
+                                // Reset triggered after a short delay
+                                // std::thread::spawn({
+                                //     let triggered = triggered.clone();
+                                //     move || {
+                                //         std::thread::sleep(Duration::from_millis(100));
+                                //         *triggered.lock().unwrap() = false;
+                                //     }
+                                // });
                             }
                         }
+
                     }
                 }
             }

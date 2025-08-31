@@ -8,4 +8,4 @@ build = "build.rs"
 cpal = "0.16.0"
 vosk = "0.3.1"
 serde_json = "1.0.143"
-triggered = "0.1.3"
+

@@ -1,0 +1,8 @@
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "/home/hyperiya/RustroverProjects/IrisVA/models/x86_64"]
+
+[target.i686-unknown-linux-gnu]
+rustflags = ["-L", "/home/hyperiya/RustroverProjects/IrisVA/models/x86"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-L", "/home/hyperiya/RustroverProjects/IrisVA/models/win64"]

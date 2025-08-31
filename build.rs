@@ -16,8 +16,7 @@ fn main() {
 
     // Platform-specific library filename to probe
     let lib_filename = match target_os.as_str() {
-        "windows" => "vosk.dll",
-        "macos" => "libvosk.dylib",
+        "windows" => "libvosk.dll",
         _ => "libvosk.so", // linux, android, etc.
     };
 
