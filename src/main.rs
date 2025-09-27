@@ -176,18 +176,23 @@ fn collect_launch_args() -> Option<Vec<(String, String)>> {
 }
 fn main() {
     if let Ok(lib_dir) = env::var("VOSK_LIB_DIR") {
-        let paths = env::var_os("LD_LIBRARY_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let new = if paths.as_os_str().is_empty() {
-            PathBuf::from(lib_dir)
+        if cfg!(target_os = "windows") {
+            let current_path = env::var("PATH").unwrap_or_default();
+            let new_path = if current_path.is_empty() {
+                lib_dir
+            } else {
+                format!("{};{}", lib_dir, current_path)
+            };
+            unsafe { env::set_var("PATH", new_path); }
         } else {
-            let p = PathBuf::from(env::var("LD_LIBRARY_PATH").unwrap_or_default());
-            let combined = format!("{}:{}", lib_dir, p.display());
-            PathBuf::from(combined)
-        };
-        unsafe {
-            env::set_var("LD_LIBRARY_PATH", new);
+            let path_var = if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+            let current_path = env::var(path_var).unwrap_or_default();
+            let new_path = if current_path.is_empty() {
+                lib_dir
+            } else {
+                format!("{}:{}", lib_dir, current_path)
+            };
+            unsafe { env::set_var(path_var, new_path); }
         }
     }
 
@@ -245,10 +250,43 @@ fn main() {
 
     let sample_rate_hz = config.sample_rate.0 as f32;
 
-    let mut recognizer1 =
-        Recognizer::new(&model, sample_rate_hz).expect("Failed to create recognizer");
-    let mut recognizer2 =
-        Recognizer::new(&model, sample_rate_hz).expect("Failed to create recognizer");
+    let grammar = [
+        // Wake words
+        "hey", "iris",
+
+        // Call controls
+        "leave call", "hang up", "disconnect", "leave",
+        "deafen", "un deafen",
+        "mute", "un mute",
+
+        // Playback controls
+        "play", "resume", "continue",
+        "pause", "stop",
+        "next song", "next", "skip",
+        "previous song", "previous", "back",
+
+        // Playlist controls
+        "shuffle", "mix", "repeat", "repeat playlist", "repeat album",
+        "repeat song", "repeat track", "stop repeating",
+
+        // Volume controls
+        "set volume", "volume", "set volume to", "increase volume", "volume up",
+        "decrease volume", "volume down", "max", "maximum",
+
+        // Numbers
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+        "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+        "sixty", "seventy", "eighty", "ninety"
+    ];
+
+
+    let mut recognizers: Vec<Recognizer> = (0..2)
+        .map(|_| Recognizer::new_with_grammar(&model, sample_rate_hz, &grammar).expect("Failed to create recognizer"))
+        .collect();
+
+    let mut recognizer1 = recognizers.pop().unwrap();
+    let mut recognizer2 = recognizers.pop().unwrap();
 
     for rec in [&mut recognizer1, &mut recognizer2] {
         let _ = rec.set_max_alternatives(0);
@@ -649,3 +687,4 @@ fn create_waveform_match(
         Err(_) => {}
     }
 }
+
