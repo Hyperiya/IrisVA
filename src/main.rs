@@ -407,7 +407,7 @@ fn main() {
                         println!("Listening for command...\\n[WAITING]");
                         listening_printed = true;
                     }
-                    if elapsed > Duration::from_secs(3) {
+                    if elapsed > Duration::from_secs(5) {
                         println!("No command detected. Resetting.[RESETTING]");
                         *current_state_guard = ListeningState::Idle; // Modify directly
                         listening_printed = false;
